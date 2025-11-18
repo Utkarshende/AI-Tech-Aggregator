@@ -5,8 +5,10 @@ const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
 
+
 // 💡 NEW STEP 1: Import the user routes file 
 const userRoutes = require('./routes/userRoutes'); 
+const linkRoutes = require('./routes/linkRoutes'); 
 
 // Load environment variables from .env file
 dotenv.config();
@@ -29,6 +31,7 @@ mongoose.connect(MONGO_URI)
 // 💡 NEW STEP 2: Use the imported router at the base path
 // This mounts userRoutes.js, meaning router.post('/login') becomes POST /api/users/login
 app.use('/api/users', userRoutes); 
+app.use('/api/links', linkRoutes);
 
 // --- Basic Route ---
 app.get('/', (req, res) => {
