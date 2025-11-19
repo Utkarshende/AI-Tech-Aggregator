@@ -1,10 +1,10 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowUp, LogIn, Sparkles, AlertTriangle, Loader2, Database, Plus, X } from 'lucide-react';
+import { ArrowUp, LogIn, Sparkles, AlertTriangle, Loader2, Database, Plus, X, User } from 'lucide-react';
 
 // --- FIREBASE IMPORTS & SETUP (MANDATORY GLOBALS) ---
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, updateDoc, doc, arrayUnion, runTransaction, query, addDoc, Timestamp } from 'firebase/firestore';
+import { getFirestore, collection, onSnapshot, runTransaction, doc, arrayUnion, query, addDoc, Timestamp } from 'firebase/firestore';
 
 // Parse global environment variables
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
@@ -14,10 +14,42 @@ const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial
 // Firestore public collection path for shared data
 const LINKS_COLLECTION_PATH = `artifacts/${appId}/public/data/links`;
 
+// --- UTILITY FUNCTIONS ---
+
+/**
+ * Formats a Firestore Timestamp object into a simple human-readable string.
+ * @param {object} timestamp - The Firestore Timestamp object.
+ * @returns {string} Formatted date string or empty string if invalid.
+ */
+const formatTimestamp = (timestamp) => {
+  if (timestamp && timestamp.toDate) {
+    const date = timestamp.toDate();
+    // Using simple format: "Month Day, Year"
+    return date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  }
+  return '';
+};
+
+/**
+ * Truncates a long user ID for display purposes.
+ * @param {string} id - The full user ID string.
+ * @returns {string} The truncated ID (first 4 and last 4 chars).
+ */
+const truncateId = (id) => {
+  if (!id || id.length < 8) return id;
+  return `${id.substring(0, 4)}...${id.substring(id.length - 4)}`;
+};
+
 
 // --- LINK CARD COMPONENT ---
 
 const LinkCard = React.memo(({ link, userId, isAuthenticated, handleVote, isVotingState }) => {
+  // Check if the link object contains a document reference. If not, we can't vote on it.
+  const canVote = link.ref && userId; 
   const isVoted = link.voterIds.includes(userId);
   const isVoting = isVotingState[link.id];
   
@@ -38,6 +70,9 @@ const LinkCard = React.memo(({ link, userId, isAuthenticated, handleVote, isVoti
   } catch (e) {
     hostname = 'Invalid URL';
   }
+  
+  const formattedDate = formatTimestamp(link.createdAt);
+  const displayAuthorId = truncateId(link.authorId);
 
   return (
     <div className="flex items-center bg-gray-700 p-4 rounded-xl shadow-lg hover:shadow-xl transition duration-300 space-x-4 border border-gray-600">
@@ -47,7 +82,7 @@ const LinkCard = React.memo(({ link, userId, isAuthenticated, handleVote, isVoti
         {isAuthenticated ? (
           <button 
             onClick={() => handleVote(link.id, link.ref)}
-            disabled={isVoted || isVoting}
+            disabled={isVoted || isVoting || !canVote}
             className={voteButtonClasses}
             aria-label={isVoted ? 'You already voted' : 'Upvote link'}
           >
@@ -80,6 +115,19 @@ const LinkCard = React.memo(({ link, userId, isAuthenticated, handleVote, isVoti
         <p className="text-sm text-gray-400 truncate">
           <span className="opacity-70">({hostname})</span>
         </p>
+        
+        {/* New Metadata Display */}
+        <div className="flex items-center text-xs text-gray-500 mt-1 space-x-2">
+            <span className="flex items-center" title={`Submitted by user ID: ${link.authorId}`}>
+                <User className="w-3 h-3 mr-1" />
+                Submitted by {displayAuthorId}
+            </span>
+            <span>|</span>
+            <span title={`Posted on: ${formattedDate}`}>
+                {formattedDate}
+            </span>
+        </div>
+        
       </div>
     </div>
   );
@@ -103,7 +151,8 @@ const LinkSubmissionForm = ({ onSubmit, onClose, disabled }) => {
     }
 
     try {
-      new URL(url.trim()); // Basic URL validation
+      // Simple validation for URL format
+      new URL(url.trim()); 
     } catch (e) {
       setValidationError("Please enter a valid URL.");
       return;
@@ -112,7 +161,6 @@ const LinkSubmissionForm = ({ onSubmit, onClose, disabled }) => {
     onSubmit({ title: title.trim(), url: url.trim() });
     setTitle('');
     setUrl('');
-    // Note: onClose() is now handled within the App component after successful submission
   };
 
   return (
@@ -264,10 +312,10 @@ const App = () => {
   // 2. Real-time Data Fetching
   useEffect(() => {
     // Only attempt to attach listener once we know the authentication state (userId)
+    // The userId being present is the final confirmation the user is logged in (even anonymously)
     if (!db || !isAuthReady || !userId) {
         if (isAuthReady && !userId) {
-            // Log for debugging if we are auth ready but still no user (anonymous sign-in failed/blocked)
-            console.log("Not fetching data: Auth is ready but userId is null.");
+            console.log("Not fetching data: Auth is ready but userId is null (maybe user is unauthenticated).");
         }
         return;
     }
@@ -341,7 +389,12 @@ const App = () => {
 
     } catch (err) {
       console.error("Voting error:", err);
-      setError(err.message || "Failed to record vote due to an unexpected error.");
+      // Check for the specific 'already voted' message to display to the user
+      if (err.message.includes("already voted")) {
+          setError(err.message);
+      } else {
+          setError("Failed to record vote due to an unexpected error.");
+      }
     } finally {
       setIsVotingState(prev => ({ ...prev, [linkId]: false }));
     }
