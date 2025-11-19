@@ -1,22 +1,15 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ArrowUp, LogIn, Sparkles, AlertTriangle, Loader2, Database } from 'lucide-react';
+import { ArrowUp, LogIn, Sparkles, AlertTriangle, Loader2, Database, Plus, X } from 'lucide-react';
 
 // --- FIREBASE IMPORTS & SETUP (MANDATORY GLOBALS) ---
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, updateDoc, doc, arrayUnion, runTransaction, query } from 'firebase/firestore';
+import { getFirestore, collection, onSnapshot, updateDoc, doc, arrayUnion, runTransaction, query, addDoc, Timestamp } from 'firebase/firestore';
 
 // Parse global environment variables
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-
-// Mock initial data used as seed if the collection is empty
-const initialSeedLinks = [
-  { title: "Modern State Management in React", url: "https://react.dev/blog", score: 154, voterIds: [], createdAt: Date.now() - 3600000 },
-  { title: "Tailwind CSS: Utility-First Styling", url: "https://tailwindcss.com", score: 89, voterIds: [], createdAt: Date.now() - 7200000 },
-  { title: "New Trends in Web Accessibility", url: "https://w3.org/a11y", score: 55, voterIds: [], createdAt: Date.now() - 10800000 },
-];
 
 // Firestore public collection path for shared data
 const LINKS_COLLECTION_PATH = `artifacts/${appId}/public/data/links`;
@@ -93,6 +86,109 @@ const LinkCard = React.memo(({ link, userId, isAuthenticated, handleVote, isVoti
 });
 
 
+// --- LINK SUBMISSION FORM COMPONENT ---
+
+const LinkSubmissionForm = ({ onSubmit, onClose, disabled }) => {
+  const [title, setTitle] = useState('');
+  const [url, setUrl] = useState('');
+  const [validationError, setValidationError] = useState('');
+
+  const handleFormSubmit = (e) => {
+    e.preventDefault();
+    setValidationError('');
+
+    if (!title.trim() || !url.trim()) {
+      setValidationError("Both Title and URL are required.");
+      return;
+    }
+
+    try {
+      new URL(url.trim()); // Basic URL validation
+    } catch (e) {
+      setValidationError("Please enter a valid URL.");
+      return;
+    }
+
+    onSubmit({ title: title.trim(), url: url.trim() });
+    setTitle('');
+    setUrl('');
+    // Note: onClose() is now handled within the App component after successful submission
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-70 flex justify-center items-center z-50 p-4" onClick={onClose}>
+      <div 
+        className="bg-gray-800 p-8 rounded-xl shadow-2xl w-full max-w-lg transform transition-all duration-300 scale-100 opacity-100"
+        onClick={(e) => e.stopPropagation()} // Prevent closing when clicking inside form
+      >
+        <div className="flex justify-between items-center border-b border-gray-700 pb-3 mb-4">
+          <h2 className="text-2xl font-bold text-white flex items-center">
+            <Plus className="w-5 h-5 mr-2 text-indigo-400" />
+            Submit New Link
+          </h2>
+          <button 
+            onClick={onClose} 
+            className="text-gray-400 hover:text-white transition"
+            aria-label="Close form"
+          >
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        <form onSubmit={handleFormSubmit}>
+          <div className="mb-4">
+            <label htmlFor="title" className="block text-sm font-medium text-gray-300 mb-1">
+              Title
+            </label>
+            <input
+              id="title"
+              type="text"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500 transition"
+              placeholder="e.g., GPT-5 Launch Details"
+              required
+              disabled={disabled}
+            />
+          </div>
+
+          <div className="mb-6">
+            <label htmlFor="url" className="block text-sm font-medium text-gray-300 mb-1">
+              URL
+            </label>
+            <input
+              id="url"
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              className="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white focus:ring-indigo-500 focus:border-indigo-500 transition"
+              placeholder="https://example.com/article"
+              required
+              disabled={disabled}
+            />
+          </div>
+
+          {validationError && (
+            <p className="text-sm text-red-400 mb-4 flex items-center">
+              <AlertTriangle className="w-4 h-4 mr-1" /> {validationError}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            className="w-full flex items-center justify-center px-4 py-2 border border-transparent text-base font-medium rounded-lg shadow-lg text-white bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 transition duration-300"
+            disabled={disabled}
+          >
+            {disabled && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+            {disabled ? 'Submitting...' : 'Post Link'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+
 // --- MAIN APPLICATION COMPONENT (HOME) ---
 
 const App = () => {
@@ -106,6 +202,10 @@ const App = () => {
   const [links, setLinks] = useState([]);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
+  
+  // UI State for Submission Form
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   
   // State to track which link is currently being voted on (to disable the button)
   const [isVotingState, setIsVotingState] = useState({}); 
@@ -163,7 +263,14 @@ const App = () => {
 
   // 2. Real-time Data Fetching
   useEffect(() => {
-    if (!db || !isAuthReady) return;
+    // Only attempt to attach listener once we know the authentication state (userId)
+    if (!db || !isAuthReady || !userId) {
+        if (isAuthReady && !userId) {
+            // Log for debugging if we are auth ready but still no user (anonymous sign-in failed/blocked)
+            console.log("Not fetching data: Auth is ready but userId is null.");
+        }
+        return;
+    }
 
     const linksRef = collection(db, LINKS_COLLECTION_PATH);
     const q = query(linksRef); 
@@ -183,19 +290,18 @@ const App = () => {
       setError(null);
 
       if (fetchedLinks.length === 0) {
-          // If the collection is empty, you might want to seed it here.
-          // For simplicity, we will assume the collection is pre-seeded or filled by another action.
-          console.log("Links collection is empty. Please add data.");
+          console.log("Links collection is empty.");
       }
 
     }, (e) => {
       console.error("Firestore Fetch Error:", e);
+      // This is often where permission errors land if the rules are too strict
       setError("Failed to load links in real-time. Check console for details.");
       setIsLoading(false);
     });
 
     return () => unsubscribe();
-  }, [db, isAuthReady]);
+  }, [db, isAuthReady, userId]);
 
 
   // 3. Handle Voting Logic (Firestore Transaction)
@@ -226,7 +332,7 @@ const App = () => {
 
         // Perform the update: increment score and add userId to voterIds array
         transaction.update(linkRef, {
-          score: data.score + 1,
+          score: (data.score || 0) + 1,
           voterIds: arrayUnion(userId) // Atomically adds userId if not present
         });
       });
@@ -235,12 +341,43 @@ const App = () => {
 
     } catch (err) {
       console.error("Voting error:", err);
-      // Display the specific error message from the transaction (e.g., "already voted")
       setError(err.message || "Failed to record vote due to an unexpected error.");
     } finally {
-      // Revert the voting state regardless of success/failure.
-      // The onSnapshot listener handles the success state update.
       setIsVotingState(prev => ({ ...prev, [linkId]: false }));
+    }
+  }, [db, userId]);
+  
+  
+  // 4. Handle Link Submission Logic (Firestore addDoc)
+  const handleSubmitLink = useCallback(async ({ title, url }) => {
+    if (!userId || !db) {
+      setError("You must be logged in to submit a link.");
+      return;
+    }
+    
+    setError(null);
+    setIsSubmitting(true);
+    
+    const newLink = {
+      title,
+      url,
+      score: 1, // Start with a score of 1 (implicitly voted by creator)
+      voterIds: [userId], // Creator votes automatically
+      createdAt: Timestamp.now(),
+      authorId: userId, // Track the author
+    };
+    
+    try {
+      const linksRef = collection(db, LINKS_COLLECTION_PATH);
+      await addDoc(linksRef, newLink);
+      console.log("Link submitted successfully.");
+      setIsFormOpen(false); // Close the form on success
+      
+    } catch (e) {
+      console.error("Submission Error:", e);
+      setError("Failed to submit link. Please try again.");
+    } finally {
+      setIsSubmitting(false);
     }
   }, [db, userId]);
 
@@ -273,7 +410,20 @@ const App = () => {
             <Sparkles className="inline w-6 h-6 mr-2 mb-1" />
             AI Tech Aggregator
           </h1>
-          <AuthStatus />
+          <div className="flex items-center space-x-4 mt-2 sm:mt-0">
+            {/* Submission button is only visible if authenticated */}
+            {userId && (
+              <button 
+                onClick={() => setIsFormOpen(true)}
+                className="flex items-center px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-full hover:bg-indigo-700 transition duration-150 shadow-md"
+                disabled={!isAuthReady || !userId}
+              >
+                <Plus className="w-4 h-4 mr-1" />
+                Submit Link
+              </button>
+            )}
+            <AuthStatus />
+          </div>
         </header>
         
         {/* Loading/Error Message Display */}
@@ -308,10 +458,19 @@ const App = () => {
             <div className="text-center p-12 bg-gray-800 rounded-xl text-gray-400">
               <Database className="w-10 h-10 mx-auto mb-4" />
               <p className="text-lg font-semibold">No links found.</p>
-              <p className="text-sm">Add a mechanism to submit new links to the "{LINKS_COLLECTION_PATH}" collection!</p>
+              <p className="text-sm">Be the first to post! Click "Submit Link" above.</p>
             </div>
           )}
         </main>
+        
+        {/* Submission Form Modal */}
+        {isFormOpen && (
+          <LinkSubmissionForm
+            onSubmit={handleSubmitLink}
+            onClose={() => setIsFormOpen(false)}
+            disabled={isSubmitting}
+          />
+        )}
         
         {/* Footer */}
         <footer className="mt-10 text-center text-sm text-gray-500 pt-4 border-t border-gray-800">
