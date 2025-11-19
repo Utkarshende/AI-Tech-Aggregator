@@ -1,43 +1,32 @@
-import React from 'react';
-import { ArrowUp, LogIn, Sparkles, AlertTriangle, Loader2 } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { ArrowUp, LogIn, Sparkles, AlertTriangle, Loader2, Database } from 'lucide-react';
 
-// --- MOCK DATA AND UTILITIES ---
+// --- FIREBASE IMPORTS & SETUP (MANDATORY GLOBALS) ---
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, onSnapshot, updateDoc, doc, arrayUnion, runTransaction, query } from 'firebase/firestore';
 
-// Mock user and link data
-const mockLinksData = [
-  { id: 1, title: "Modern State Management in React", url: "https://react.dev/blog", score: 154, userId: "user-abc", userVoted: false, isVoting: false },
-  { id: 2, title: "Tailwind CSS: Utility-First Styling", url: "https://tailwindcss.com", score: 89, userId: "user-xyz", userVoted: false, isVoting: false },
-  { id: 3, title: "The Power of Single-File Components", url: "https://google.com", score: 210, userId: "current-user-123", userVoted: true, isVoting: false }, // User has already voted on this one
-  { id: 4, title: "New Trends in Web Accessibility", url: "https://w3.org/a11y", score: 55, userId: "user-def", userVoted: false, isVoting: false },
+// Parse global environment variables
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Mock initial data used as seed if the collection is empty
+const initialSeedLinks = [
+  { title: "Modern State Management in React", url: "https://react.dev/blog", score: 154, voterIds: [], createdAt: Date.now() - 3600000 },
+  { title: "Tailwind CSS: Utility-First Styling", url: "https://tailwindcss.com", score: 89, voterIds: [], createdAt: Date.now() - 7200000 },
+  { title: "New Trends in Web Accessibility", url: "https://w3.org/a11y", score: 55, voterIds: [], createdAt: Date.now() - 10800000 },
 ];
 
-// Mock API Call Utility
-/**
- * Simulates a protected PATCH /api/links/:id/vote endpoint.
- * @param {number} linkId - The ID of the link being voted on.
- * @param {string} userId - The ID of the current user.
- * @returns {Promise<{success: boolean, message?: string}>}
- */
-const fetchApi = (linkId, userId) => {
-  return new Promise((resolve, reject) => {
-    setTimeout(() => {
-      // Mock failure condition: User already voted on link 3
-      if (linkId === 3 && userId === 'current-user-123') {
-        reject({ message: "You have already voted on this link." });
-        return;
-      }
-      
-      // Mock successful vote
-      resolve({ success: true, message: "Vote recorded successfully." });
-    }, 500); // Simulate network latency
-  });
-};
+// Firestore public collection path for shared data
+const LINKS_COLLECTION_PATH = `artifacts/${appId}/public/data/links`;
+
 
 // --- LINK CARD COMPONENT ---
 
-const LinkCard = ({ link, isAuthenticated, handleVote }) => {
-  const isVoted = link.userVoted;
-  const isVoting = link.isVoting;
+const LinkCard = React.memo(({ link, userId, isAuthenticated, handleVote, isVotingState }) => {
+  const isVoted = link.voterIds.includes(userId);
+  const isVoting = isVotingState[link.id];
   
   // Dynamic button state and classes
   const voteButtonClasses = `
@@ -50,6 +39,13 @@ const LinkCard = ({ link, isAuthenticated, handleVote }) => {
     }
   `;
 
+  let hostname = '';
+  try {
+    hostname = new URL(link.url).hostname;
+  } catch (e) {
+    hostname = 'Invalid URL';
+  }
+
   return (
     <div className="flex items-center bg-gray-700 p-4 rounded-xl shadow-lg hover:shadow-xl transition duration-300 space-x-4 border border-gray-600">
       
@@ -57,7 +53,7 @@ const LinkCard = ({ link, isAuthenticated, handleVote }) => {
       <div className="flex flex-col items-center min-w-[50px]">
         {isAuthenticated ? (
           <button 
-            onClick={() => handleVote(link.id)}
+            onClick={() => handleVote(link.id, link.ref)}
             disabled={isVoted || isVoting}
             className={voteButtonClasses}
             aria-label={isVoted ? 'You already voted' : 'Upvote link'}
@@ -89,117 +85,237 @@ const LinkCard = ({ link, isAuthenticated, handleVote }) => {
           {link.title}
         </a>
         <p className="text-sm text-gray-400 truncate">
-          <span className="opacity-70">({new URL(link.url).hostname})</span>
+          <span className="opacity-70">({hostname})</span>
         </p>
       </div>
-      
     </div>
   );
-};
+});
+
 
 // --- MAIN APPLICATION COMPONENT (HOME) ---
 
 const App = () => {
-  // Use local state to manage the list of links
-  const [links, setLinks] = React.useState(mockLinksData.sort((a, b) => b.score - a.score));
-  
-  // Mock authentication state (true = logged in)
-  const [isAuthenticated, setIsAuthenticated] = React.useState(true);
-  const [userId] = React.useState('current-user-123'); 
-  
-  // UI feedback for errors
-  const [error, setError] = React.useState(null);
-  
-  // Function to handle the vote action
-  const handleVote = async (linkId) => {
-    setError(null); // Clear previous errors
+  // Firebase State
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
 
-    // 1. Find the link and initiate optimistic update
-    setLinks(prevLinks => prevLinks.map(link => 
-      link.id === linkId 
-        ? { ...link, isVoting: true }
-        : link
-    ));
+  // Application State
+  const [links, setLinks] = useState([]);
+  const [error, setError] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  
+  // State to track which link is currently being voted on (to disable the button)
+  const [isVotingState, setIsVotingState] = useState({}); 
+
+  // 1. Initialize Firebase and Auth
+  useEffect(() => {
+    try {
+      if (Object.keys(firebaseConfig).length > 0) {
+        const app = initializeApp(firebaseConfig);
+        const firestore = getFirestore(app);
+        const authInstance = getAuth(app);
+        
+        setDb(firestore);
+        setAuth(authInstance);
+
+        // Listen for auth state changes
+        const unsubscribeAuth = onAuthStateChanged(authInstance, (user) => {
+          if (user) {
+            setUserId(user.uid);
+          } else {
+            setUserId(null); // User is logged out
+          }
+          setIsAuthReady(true);
+        });
+
+        // Sign in using the custom token or anonymously
+        const signIn = async () => {
+          try {
+            if (initialAuthToken) {
+              await signInWithCustomToken(authInstance, initialAuthToken);
+              console.log("Signed in with custom token.");
+            } else {
+              await signInAnonymously(authInstance);
+              console.log("Signed in anonymously.");
+            }
+          } catch (e) {
+            console.error("Firebase Auth Error:", e);
+            setError("Could not establish user session.");
+          }
+        };
+
+        signIn();
+        
+        return () => unsubscribeAuth();
+      } else {
+        setError("Firebase configuration is missing.");
+        setIsAuthReady(true);
+      }
+    } catch (e) {
+      console.error("Firebase Initialization Error:", e);
+      setError("Failed to initialize Firebase services.");
+      setIsAuthReady(true);
+    }
+  }, []);
+
+  // 2. Real-time Data Fetching
+  useEffect(() => {
+    if (!db || !isAuthReady) return;
+
+    const linksRef = collection(db, LINKS_COLLECTION_PATH);
+    const q = query(linksRef); 
+    
+    // Set up real-time listener
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const fetchedLinks = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ref: doc.ref, // Store reference for voting updates
+        ...doc.data(),
+      }));
+
+      // Sort by score (client-side sort to avoid requiring Firestore indexes)
+      fetchedLinks.sort((a, b) => b.score - a.score); 
+      setLinks(fetchedLinks);
+      setIsLoading(false);
+      setError(null);
+
+      if (fetchedLinks.length === 0) {
+          // If the collection is empty, you might want to seed it here.
+          // For simplicity, we will assume the collection is pre-seeded or filled by another action.
+          console.log("Links collection is empty. Please add data.");
+      }
+
+    }, (e) => {
+      console.error("Firestore Fetch Error:", e);
+      setError("Failed to load links in real-time. Check console for details.");
+      setIsLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, [db, isAuthReady]);
+
+
+  // 3. Handle Voting Logic (Firestore Transaction)
+  const handleVote = useCallback(async (linkId, linkRef) => {
+    if (!userId || !db) {
+      setError("You must be logged in to vote.");
+      return;
+    }
+    
+    setError(null);
+    setIsVotingState(prev => ({ ...prev, [linkId]: true }));
 
     try {
-      // 2. Call the mock API (simulates PATCH /api/links/:id/vote)
-      await fetchApi(linkId, userId);
+      await runTransaction(db, async (transaction) => {
+        const linkDoc = await transaction.get(linkRef);
 
-      // 3. Success: Final update, increment score, mark as voted, and resort
-      setLinks(prevLinks => {
-        const newLinks = prevLinks.map(link => 
-          link.id === linkId 
-            ? { ...link, score: link.score + 1, userVoted: true, isVoting: false }
-            : link
-        );
-        // Sort by score immediately after a successful vote
-        return newLinks.sort((a, b) => b.score - a.score);
+        if (!linkDoc.exists()) {
+          throw new Error("Link does not exist.");
+        }
+
+        const data = linkDoc.data();
+        const voterIds = data.voterIds || [];
+
+        // Check if user has already voted
+        if (voterIds.includes(userId)) {
+          throw new Error("You have already voted on this link.");
+        }
+
+        // Perform the update: increment score and add userId to voterIds array
+        transaction.update(linkRef, {
+          score: data.score + 1,
+          voterIds: arrayUnion(userId) // Atomically adds userId if not present
+        });
       });
+      
+      console.log(`Vote recorded successfully for link ${linkId}`);
 
     } catch (err) {
-      // 4. Failure: Revert optimistic change and show error
-      setLinks(prevLinks => prevLinks.map(link => 
-        link.id === linkId 
-          ? { ...link, isVoting: false }
-          : link
-      ));
-      
-      console.error("Voting error:", err.message);
-      setError(err.message || "An unknown error occurred during voting.");
-
+      console.error("Voting error:", err);
+      // Display the specific error message from the transaction (e.g., "already voted")
+      setError(err.message || "Failed to record vote due to an unexpected error.");
+    } finally {
+      // Revert the voting state regardless of success/failure.
+      // The onSnapshot listener handles the success state update.
+      setIsVotingState(prev => ({ ...prev, [linkId]: false }));
     }
+  }, [db, userId]);
+
+
+  // Link to display current user and status
+  const AuthStatus = () => {
+    if (!isAuthReady) {
+      return <span className="text-sm text-gray-500 flex items-center"><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Authenticating...</span>;
+    }
+    
+    if (userId) {
+      // Show the complete userId as required for multi-user apps
+      return (
+        <span className="text-sm text-indigo-400" title={`User ID: ${userId}`}>
+          Signed in: <span className="font-mono text-xs">{userId}</span>
+        </span>
+      );
+    }
+    
+    return <span className="text-sm text-red-400">Not authenticated.</span>;
   };
   
-  // Link to simulate login/logout
-  const AuthLink = () => (
-    <button 
-      onClick={() => setIsAuthenticated(prev => !prev)}
-      className="text-sm text-indigo-400 hover:text-indigo-300 transition duration-150"
-    >
-      {isAuthenticated ? `Signed in as ${userId} (Click to Logout)` : 'Click to Login'}
-    </button>
-  );
-
   return (
     <div className="min-h-screen bg-gray-900 font-sans p-4 sm:p-8">
       <div className="max-w-3xl mx-auto">
         
         {/* Header */}
-        <header className="flex justify-between items-center py-6 border-b border-gray-700 mb-6">
-          <h1 className="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-teal-400 to-sky-500">
+        <header className="flex flex-col sm:flex-row justify-between items-start sm:items-center py-6 border-b border-gray-700 mb-6">
+          <h1 className="text-3xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-teal-400 to-sky-500 mb-2 sm:mb-0">
             <Sparkles className="inline w-6 h-6 mr-2 mb-1" />
-            HN Clone
+            AI Tech Aggregator
           </h1>
-          <AuthLink />
+          <AuthStatus />
         </header>
         
-        {/* Error Message Display */}
+        {/* Loading/Error Message Display */}
+        {isLoading && (
+          <div className="mb-4 p-3 bg-gray-800 text-gray-300 border border-gray-700 rounded-lg flex items-center justify-center shadow-lg">
+            <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+            <p className="font-medium text-sm">Loading links from Firestore...</p>
+          </div>
+        )}
+        
         {error && (
           <div className="mb-4 p-3 bg-red-800/30 text-red-300 border border-red-700 rounded-lg flex items-center shadow-lg">
             <AlertTriangle className="w-5 h-5 mr-2" />
             <p className="font-medium text-sm">{error}</p>
-            {/* Conditional Login/Register link if not authenticated and error is auth related */}
-            {!isAuthenticated && error.includes("vote") && (
-              <a href="#login" className="ml-auto underline font-semibold">Log In Now</a>
-            )}
           </div>
         )}
 
         {/* Links List */}
         <main className="space-y-4">
-          {links.map((link) => (
-            <LinkCard 
-              key={link.id} 
-              link={link} 
-              isAuthenticated={isAuthenticated} 
-              handleVote={handleVote} 
-            />
-          ))}
+          {links.length > 0 ? (
+            links.map((link) => (
+              <LinkCard 
+                key={link.id} 
+                link={link} 
+                userId={userId}
+                isAuthenticated={!!userId} 
+                handleVote={handleVote} 
+                isVotingState={isVotingState}
+              />
+            ))
+          ) : !isLoading && (
+            <div className="text-center p-12 bg-gray-800 rounded-xl text-gray-400">
+              <Database className="w-10 h-10 mx-auto mb-4" />
+              <p className="text-lg font-semibold">No links found.</p>
+              <p className="text-sm">Add a mechanism to submit new links to the "{LINKS_COLLECTION_PATH}" collection!</p>
+            </div>
+          )}
         </main>
         
         {/* Footer */}
         <footer className="mt-10 text-center text-sm text-gray-500 pt-4 border-t border-gray-800">
-          <p>Links are sorted by score. Try voting on item 3 (it will fail) and other items (they will succeed).</p>
+          <p>Data is now fetched and updated in real-time using Firestore.</p>
         </footer>
       </div>
     </div>
